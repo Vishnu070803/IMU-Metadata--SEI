@@ -1,93 +1,113 @@
-# IMU-Avigna
+# 🛰️ IMU-Avigna: Unified SEI Metadata Pipeline
 
+[![Project Status: Active](https://img.shields.io/badge/Project%20Status-Active-brightgreen.svg)]()
+[![Platform: i.MX8M Plus](https://img.shields.io/badge/Platform-i.MX8M%20Plus-orange.svg)]()
+[![Hardware: ICM20948](https://img.shields.io/badge/Sensor-ICM20948-blue.svg)]()
 
+**IMU-Avigna** is a high-performance, low-latency framework designed to synchronize and embed high-frequency IMU data (Accelerometer, Gyroscope, Magnetometer) directly into H.264/H.265 video streams. By leveraging **Supplemental Enhancement Information (SEI) NAL units**, this pipeline ensures frame-accurate metadata synchronization for robotics, AR/VR, and stabilized recording applications.
 
-## Getting started
+---
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## 🏗️ System Architecture
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+The pipeline consists of three primary stages: **Injection**, **Transmission**, and **Extraction**.
 
-## Add your files
+```mermaid
+graph TD
+    subgraph "Embedded Board (i.MX8MP)"
+        A[ICM20948 Sensor] -->|IOCTL| B(SEI Server)
+        C[Camera / ISP] -->|Raw Frames| B
+        B -->|H.264 + SEI| D{RTSP / Local Storage}
+    end
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+    subgraph "Host / PC"
+        D -->|RTSP Stream| E(SEI Client)
+        E -->|Live HUD| F[Real-time Display]
+        E -->|Log| G[CSV Export]
+    end
 
+    subgraph "Post-Processing"
+        D -->|MP4 File| H(SEI Extractor)
+        H -->|Offline| I[CSV / Analytics]
+    end
+
+    style B fill:#f96,stroke:#333,stroke-width:2px
+    style E fill:#6cf,stroke:#333,stroke-width:2px
+    style H fill:#9f9,stroke:#333,stroke-width:2px
 ```
-cd existing_repo
-git remote add origin http://192.168.10.242/ip-camera/imu-avigna.git
-git branch -M main
-git push -uf origin main
+
+---
+
+## 🚀 Key Features
+
+* **Frame-Accurate Sync:** IMU data is sampled at the exact moment of frame capture and injected as a prefix SEI NAL unit.
+* **Hardware Accelerated:** Optimized for the i.MX8M Plus VPU/ISP using GStreamer hardware plugins (`v4l2h264enc`).
+* **Real-time HUD:** High-speed Cairo-based overlay for live telemetry visualization on the client side.
+* **Zero-Copy Extraction:** Offline extractor parses `.mp4` containers at maximum disk speed without re-encoding.
+* **Unified Workspace:** Clean, modular structure separating common headers, server, client, and extractor logic.
+
+---
+
+## 📁 Project Structure
+
+| Directory | Description |
+| :--- | :--- |
+| [**`sei_unified/`**](./sei_unified/) | **Active Production Code.** Contains the consolidated pipeline. |
+| `sei_unified/server/` | Embedded application for metadata injection and streaming. |
+| `sei_unified/client/` | Host application for live viewing and HUD overlay. |
+| `sei_unified/extractor/` | CLI tool for batch metadata extraction from recordings. |
+| `sei_unified/common/` | Shared data structures and binary layout definitions. |
+| [`archives/`](./archives/) | Legacy implementations and previous iterations of the pipeline. |
+| [`reference/`](./reference/) | Documentation, sample outputs, and reference data. |
+
+---
+
+## ⚡ Quick Start
+
+### 1. Hardware Setup
+
+Ensure you are using an **i.MX8M Plus** development board with an **ICM20948** IMU connected via SPI/I2C and correctly mapped in the device tree.
+
+### 2. Dependencies
+
+Run the dependency installer on both the board and the host PC:
+
+```bash
+cd sei_unified/
+chmod +x install_dependencies.sh
+./install_dependencies.sh
 ```
 
-## Integrate with your tools
+### 3. Deploying the Server (Board)
 
-- [ ] [Set up project integrations](http://192.168.10.242/ip-camera/imu-avigna/-/settings/integrations)
+```bash
+cd sei_unified/server/
+./build_and_run_server.sh
+```
 
-## Collaborate with your team
+### 4. Running the Client (PC)
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+```bash
+cd sei_unified/client/
+./build_and_run_client.sh --ip <board_ip>
+```
 
-## Test and Deploy
+---
 
-Use the built-in continuous integration in GitLab.
+## 📊 Data Format
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+The IMU metadata is packed into a **110-byte binary payload** within a User Data Unregistered SEI NAL unit (UUID: `5345494d-5544-4154-415f-424c-4f43-4b`).
 
-***
+For specific byte offsets and field definitions, see [sei_metadata.h](./sei_unified/common/sei_metadata.h).
 
-# Editing this README
+---
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+## 🛠️ Maintenance & Development
 
-## Suggestions for a good README
+The project uses a unified header approach in `sei_unified/common/`. Any changes to the `IMUPayload` struct must be followed by a recompile of all three components (Server, Client, Extractor) to maintain binary compatibility.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+### Maintainer
 
-## Name
-Choose a self-explaining name for your project.
+* **Name**: Vishnu Siddavatam (Smart IP Team)
+* **Email**: <vishnuvardhan.siddavatam@vconnectech.in>
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
