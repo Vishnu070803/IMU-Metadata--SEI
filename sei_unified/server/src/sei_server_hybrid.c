@@ -6,29 +6,64 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <time.h>
+#include <glib-unix.h>
 
 /* Use the exact same injection logic as UVC */
-#include "uvc_sei_injection.h"
+int g_imu_hz = 0; /* Defaults to 0 (inline polling once per frame) */
+#include "uvc_sei_injection_hybrid.h"
 
-/* ─── Session duration ──────────────────────────────────────────────────── *
- *
- * Once the first client connects, a one-shot 5-minute timer is started.
- * When the timer fires the main loop is quit and the process exits cleanly.
- * Subsequent connections within the same 5-minute window do NOT reset the
- * timer — the countdown starts at first-connect and runs to completion.
- */
-#define SESSION_DURATION_SECONDS  (5 * 60)   /* 300 s = 5 minutes */
+static gboolean    g_shutting_down_completely = FALSE;
+static GMainLoop  *g_main_loop      = NULL;   
+static GstElement *g_active_pipeline = NULL; /* Used to send EOS on shutdown */
+static guint       g_shutdown_timer = 0;      /* non-zero once timer is armed    */
+static int         g_timeout_seconds = 0;   /* Session timeout in seconds, 0 = continuous */
 
-static GMainLoop *g_main_loop      = NULL;   /* set in main(), used in timer cb */
-static guint      g_shutdown_timer = 0;      /* non-zero once timer is armed    */
+/* ─── EOS wait timeout — if bus EOS never arrives, force quit ──────────── */
+static gboolean eos_timeout_cb(gpointer user_data) {
+    (void)user_data;
+    g_printerr("System Link: WARNING — EOS timeout after 10s, forcing quit.\n");
+    if (g_shutting_down_completely) {
+        g_main_loop_quit(g_main_loop);
+    }
+    return G_SOURCE_REMOVE;
+}
 
-/* ─── Timer callback — fires once after SESSION_DURATION_SECONDS ────────── */
+
+/* ─── Timer callback — fires once after g_timeout_seconds ────────── */
 static gboolean session_timeout_cb(gpointer user_data)
 {
     (void)user_data;
-    g_print("\nSystem Link: 5-minute session timer expired. Shutting down server.\n");
-    g_main_loop_quit(g_main_loop);
+    g_print("\nSystem Link: %d-second session timer expired. Stopping current stream.\n", g_timeout_seconds);
+    g_shutdown_timer = 0;
+    if (g_active_pipeline) {
+        g_print("System Link: Sending EOS to cleanly finalize recording...\n");
+        gst_element_send_event(g_active_pipeline, gst_event_new_eos());
+    }
     return G_SOURCE_REMOVE;   /* one-shot: do not repeat */
+}
+
+static gboolean sigint_handler(gpointer user_data) {
+    (void)user_data;
+    g_print("\nCtrl+C caught! Shutting down server cleanly.\n");
+    g_shutting_down_completely = TRUE;
+    
+    gboolean needs_eos = FALSE;
+    if (g_active_pipeline) {
+        GstState state;
+        gst_element_get_state(g_active_pipeline, &state, NULL, 0);
+        if (state == GST_STATE_PLAYING || state == GST_STATE_PAUSED) {
+            needs_eos = TRUE;
+        }
+    }
+    
+    if (needs_eos) {
+        g_print("System Link: Sending EOS and waiting for pipeline to reach NULL state...\n");
+        gst_element_send_event(g_active_pipeline, gst_event_new_eos());
+        g_timeout_add_seconds(10, eos_timeout_cb, NULL);
+    } else {
+        g_main_loop_quit(g_main_loop);
+    }
+    return G_SOURCE_REMOVE;
 }
 
 /* ─── Per-branch SEI probe contexts ────────────────────────────────────── *
@@ -44,33 +79,13 @@ static gboolean session_timeout_cb(gpointer user_data)
 static SeiProbeCtx rtsp_probe_ctx = { .is_hevc = 0, .read_idx = 0 };
 static SeiProbeCtx  rec_probe_ctx = { .is_hevc = 0, .read_idx = 0 };
 
-/* ─── Recording file path (set once in main, used in configure callback) ─ */
-static char g_rec_path[256];
+/* ─── Recording directory (set from args) ─ */
+static char g_rec_dir[256] = "/tmp";
 
-/* ─── media-connected signal callback ──────────────────────────────────── *
- *
- * Fired by GstRTSPMedia the first time a client transport is connected to
- * the media object.  We use it as the "client arrived" event to arm the
- * 5-minute shutdown timer.  The timer is armed at most once per process
- * lifetime (g_shutdown_timer guard).
- */
-static void media_connected_cb(GstRTSPMedia *media, gpointer user_data)
-{
-    (void)media; (void)user_data;
 
-    if (g_shutdown_timer != 0) {
-        /* Timer already running — ignore additional connections */
-        g_print("System Link: additional client connected "
-                "(session timer already running).\n");
-        return;
-    }
 
-    g_print("System Link: first client connected — "
-            "starting %d-second session timer.\n", SESSION_DURATION_SECONDS);
-
-    g_shutdown_timer = g_timeout_add_seconds(SESSION_DURATION_SECONDS,
-                                             session_timeout_cb, NULL);
-}
+/* Forward declaration — used in media_configure_cb before definition */
+static void media_new_state_cb(GstRTSPMedia *media, gint state, gpointer user_data);
 
 /* ─── Media configure callback ─────────────────────────────────────────── *
  *
@@ -107,8 +122,23 @@ static void media_configure_cb(GstRTSPMediaFactory *factory, GstRTSPMedia *media
                                 gpointer user_data)
 {
     (void)factory; (void)user_data;
+    
+    /* Reset all state (frame counters, fps counters, caps flag) for the new session */
+    uvc_sei_reset_session();
 
     GstElement *pipeline = gst_rtsp_media_get_element(media);
+    
+    if (g_active_pipeline) {
+        gst_object_unref(g_active_pipeline);
+    }
+    g_active_pipeline = gst_object_ref(pipeline); /* Save strong reference for graceful shutdown */
+
+    /* ── Enable automatic EOS on client disconnect ──────────────────── *
+     * By setting eos-shutdown to TRUE, the RTSP Server will automatically 
+     * send an EOS event down the pipeline when the client disconnects, 
+     * ensuring mp4mux naturally writes the moov atom without Ctrl+C!
+     */
+    gst_rtsp_media_set_eos_shutdown(media, TRUE);
 
     /* ── 0. Arm the session timer on first client connect ────────────── *
      *
@@ -119,15 +149,7 @@ static void media_configure_cb(GstRTSPMediaFactory *factory, GstRTSPMedia *media
      * connected to this specific media object.
      */
     g_signal_connect(media, "new-state",
-                     G_CALLBACK(media_connected_cb), NULL);
-    /* GstRTSPMedia emits "new-state" for every state change.
-     * We re-use the guard (g_shutdown_timer != 0) inside the callback
-     * so the timer is armed exactly once when the pipeline reaches PLAYING.
-     *
-     * Alternative: use the "connected" signal if your gst-rtsp-server build
-     * exposes it (available since 1.14).  new-state with GST_STATE_PLAYING
-     * is universally available and semantically equivalent for our purpose.
-     */
+                     G_CALLBACK(media_new_state_cb), NULL);
 
     /* ── 1. Camera source probe (zero-latency IMU sampling) ─────────── */
     GstElement *cam = gst_bin_get_by_name(GST_BIN(pipeline), "cam_src");
@@ -137,7 +159,7 @@ static void media_configure_cb(GstRTSPMediaFactory *factory, GstRTSPMedia *media
             gst_pad_add_probe(cam_pad, GST_PAD_PROBE_TYPE_BUFFER,
                               camera_src_probe, NULL, NULL);
             gst_object_unref(cam_pad);
-            g_print("System Link: camera_src_probe attached (zero-latency IMU).\n");
+            g_print("System Link: camera_src_probe attached to cam_src (zero-latency marker).\n");
         }
         gst_object_unref(cam);
     } else {
@@ -174,7 +196,25 @@ static void media_configure_cb(GstRTSPMediaFactory *factory, GstRTSPMedia *media
         g_printerr("System Link: FATAL — hw_enc_rec element not found in pipeline.\n");
     }
 
-    g_print("Recording path: %s\n", g_rec_path);
+    /* ── 4. Generate dynamic recording file name ────────────────────── */
+    GstElement *sink = gst_bin_get_by_name(GST_BIN(pipeline), "rec_sink");
+    if (sink) {
+        char new_path[512];
+        time_t now = time(NULL);
+        struct tm *t = localtime(&now);
+        snprintf(new_path, sizeof(new_path),
+                 "%s/recording_%04d%02d%02d_%02d%02d%02d.mp4",
+                 g_rec_dir,
+                 t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+                 t->tm_hour, t->tm_min, t->tm_sec);
+        
+        g_object_set(sink, "location", new_path, NULL);
+        g_print("System Link: Setting new recording path for client session: %s\n", new_path);
+        gst_object_unref(sink);
+    } else {
+        g_printerr("System Link: WARNING — rec_sink element not found in pipeline.\n");
+    }
+
     gst_object_unref(pipeline);
 }
 
@@ -182,25 +222,45 @@ static void media_configure_cb(GstRTSPMediaFactory *factory, GstRTSPMedia *media
  *
  * GstRTSPMedia::new-state passes an integer state, not a GstState enum.
  * We arm the timer only when the media reaches GST_STATE_PLAYING (4).
+ * We clean up the pipeline when the media reaches GST_STATE_NULL (1).
  */
 static void media_new_state_cb(GstRTSPMedia *media, gint state, gpointer user_data)
 {
     (void)media; (void)user_data;
 
-    if (state != GST_STATE_PLAYING) return;   /* ignore non-PLAYING transitions */
+    if (state == GST_STATE_PLAYING) {
+        if (g_timeout_seconds <= 0) {
+            g_print("System Link: media reached PLAYING — running in continuous mode.\n");
+            return;
+        }
 
-    if (g_shutdown_timer != 0) {
-        g_print("System Link: media reached PLAYING "
-                "(session timer already running).\n");
-        return;
+        if (g_shutdown_timer != 0) {
+            g_print("System Link: media reached PLAYING (session timer already running).\n");
+            return;
+        }
+
+        g_print("System Link: media reached PLAYING — starting %d-second (%d-minute) session timer.\n",
+                g_timeout_seconds, g_timeout_seconds / 60);
+
+        g_shutdown_timer = g_timeout_add_seconds(g_timeout_seconds, session_timeout_cb, NULL);
+    } 
+    else if (state == GST_STATE_NULL) {
+        g_print("System Link: media reached NULL state. Pipeline torn down cleanly, moov atom written.\n");
+        gst_rtsp_media_set_shared(media, FALSE); /* Evict dead media from factory cache */
+        if (g_shutdown_timer != 0) {
+            g_source_remove(g_shutdown_timer);
+            g_shutdown_timer = 0;
+        }
+        if (g_active_pipeline) {
+            gst_object_unref(g_active_pipeline);
+            g_active_pipeline = NULL;
+        }
+        if (g_shutting_down_completely) {
+            g_main_loop_quit(g_main_loop);
+        } else {
+            g_print("System Link: Waiting for new client connections...\n");
+        }
     }
-
-    g_print("System Link: media reached PLAYING — "
-            "starting %d-second (%d-minute) session timer.\n",
-            SESSION_DURATION_SECONDS, SESSION_DURATION_SECONDS / 60);
-
-    g_shutdown_timer = g_timeout_add_seconds(SESSION_DURATION_SECONDS,
-                                             session_timeout_cb, NULL);
 }
 
 int main(int argc, char *argv[])
@@ -210,25 +270,22 @@ int main(int argc, char *argv[])
     const char *ip    = "0.0.0.0";
     const char *port  = "8554";
     const char *mount = "/stream";
-    const char *rec_dir = "/tmp";
+    const char *camera_dev = "/dev/video3";
 
     for (int i = 1; i < argc; i++) {
         if      (strcmp(argv[i], "--ip")      == 0 && i + 1 < argc) ip      = argv[++i];
         else if (strcmp(argv[i], "--port")    == 0 && i + 1 < argc) port    = argv[++i];
         else if (strcmp(argv[i], "--mount")   == 0 && i + 1 < argc) mount   = argv[++i];
-        else if (strcmp(argv[i], "--rec-dir") == 0 && i + 1 < argc) rec_dir = argv[++i];
+        else if (strcmp(argv[i], "--imu-hz")  == 0 && i + 1 < argc) g_imu_hz = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) g_timeout_seconds = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--camera")  == 0 && i + 1 < argc) camera_dev = argv[++i];
+        else if (strcmp(argv[i], "--rec-dir") == 0 && i + 1 < argc) {
+            strncpy(g_rec_dir, argv[++i], sizeof(g_rec_dir) - 1);
+        }
     }
 
-    /* Build a timestamped recording filename */
-    {
-        time_t now = time(NULL);
-        struct tm *t = localtime(&now);
-        snprintf(g_rec_path, sizeof(g_rec_path),
-                 "%s/recording_%04d%02d%02d_%02d%02d%02d.mp4",
-                 rec_dir,
-                 t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-                 t->tm_hour, t->tm_min, t->tm_sec);
-    }
+    /* Ensure recording directory exists to prevent filesink from failing */
+    g_mkdir_with_parents(g_rec_dir, 0755);
 
     /* Initialize IMU (opens /dev/icm20948 once; falls back to simulation) */
     imu_open();
@@ -238,41 +295,15 @@ int main(int argc, char *argv[])
     GstRTSPMountPoints *mounts   = gst_rtsp_server_get_mount_points(server);
     GstRTSPMediaFactory *factory = gst_rtsp_media_factory_new();
 
+    /* Register SIGINT handler */
+    g_unix_signal_add(SIGINT, (GSourceFunc)sigint_handler, NULL);
+
     gst_rtsp_server_set_address(server, ip);
     gst_rtsp_server_set_service(server, port);
 
-    /* ── Pipeline: tee-based dual-encoder ──────────────────────────────── *
-     *
-     * v4l2src → queue → videoconvert → tee ─┬─ queue → v4l2h264enc (RTSP) → h264parse → rtph264pay
-     *    ↑                                   └─ queue → v4l2h264enc (REC)  → h264parse → mp4mux → filesink
-     * cam_src_probe
-     *
-     * Why two encoders instead of one shared encoder?
-     *   The i.MX8MP VPU does not support sharing a single encoder instance
-     *   between two downstream sinks. Using a tee before the encoder with a
-     *   single encoder and two output queues causes pipeline stalls or
-     *   corrupted output because the encoder's internal buffer pool is not
-     *   designed for fan-out. Two separate encoder instances (one per branch)
-     *   each get their own exclusive VPU session and buffer pool.
-     *
-     * Bitrate: 10 Mbps (10,000,000 bps) on both branches.
-     *   Matches the minimum requirement of >= 9 Mbps for 1080p30 High profile.
-     *
-     * Queue leaky=downstream on both branches:
-     *   If the recording sink (disk I/O) stalls momentarily, frames are
-     *   dropped on the recording branch without stalling the RTSP branch.
-     *   The RTSP branch's leaky queue gives the same protection against
-     *   encoder or network backpressure.
-     *
-     * mp4mux fragment-duration=1000:
-     *   Writes a moov atom update every ~1 second so the file is usable
-     *   even if the pipeline exits uncleanly (e.g. power loss). Without
-     *   this the file would be unplayable since the final moov atom is
-     *   never written.
-     */
     char launch_str[1024];
     snprintf(launch_str, sizeof(launch_str),
-        "( v4l2src name=cam_src device=/dev/video3 do-timestamp=true ! "
+        "( v4l2src name=cam_src device=%s do-timestamp=true ! "
         "queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
         "videoconvert ! video/x-raw,width=1920,height=1080,framerate=30/1 ! "
         "tee name=t "
@@ -288,8 +319,8 @@ int main(int argc, char *argv[])
         "v4l2h264enc name=hw_enc_rec extra-controls=\"controls,video_bitrate=10000000\" ! "
         "video/x-h264,profile=high,stream-format=byte-stream ! "
         "h264parse ! mp4mux fragment-duration=1000 ! "
-        "filesink location=%s sync=false )",
-        g_rec_path);
+        "filesink name=rec_sink location=/tmp/dummy.mp4 sync=false )",
+        camera_dev);
 
     gst_rtsp_media_factory_set_launch(factory, launch_str);
     gst_rtsp_media_factory_set_shared(factory, TRUE);
@@ -314,16 +345,21 @@ int main(int argc, char *argv[])
 
     g_print("\n");
     g_print("Advanced RTSP Server active at rtsp://%s:%s%s\n", ip, port, mount);
-    g_print("  Resolution  : 1920x1080 @ 30fps\n");
+    g_print("  Resolution  : 1920x1080 @ 30fps (native v4l2src)\n");
     g_print("  Bitrate     : 10 Mbps CBR (both branches, via V4L2 extra-controls)\n");
-    g_print("  IMU sync    : < 1ms (camera_src_probe inline IOCTL at frame arrival)\n");
-    g_print("  SEI payload : %zu bytes (UUID + SeiMetadata) per branch\n",
+    if (g_imu_hz > 0)
+        g_print("  IMU mode    : Approach 2 — background thread at %d Hz (~%.2f samples/frame)\n", g_imu_hz, (float)g_imu_hz / 30.0);
+    else
+        g_print("  IMU mode    : Approach 1 — inline IOCTL at 30Hz (≤1ms latency per frame)\n");
+    g_print("  SEI payload : %zu bytes (UUID + SeiMetadata) per IMU sample\n",
             16 + sizeof(SeiMetadata));
     g_print("  RTSP branch : hw_enc_rtsp → h264parse → rtph264pay\n");
-    g_print("  REC  branch : hw_enc_rec  → h264parse → mp4mux → %s\n", g_rec_path);
-    g_print("  Session     : auto-shutdown after %d minutes from first client PLAY\n",
-            SESSION_DURATION_SECONDS / 60);
+    g_print("  REC  branch : hw_enc_rec  → h264parse → mp4mux → dynamically named in %s\n", g_rec_dir);
+    g_print("  Session     : auto-stop after %d minutes (use --timeout 0 for continuous)\n",
+            g_timeout_seconds / 60);
     g_print("  Hint        : Use --rec-dir <path> to set recording directory\n");
+    g_print("  Hint        : Use --imu-hz <hz> to enable high-frequency IMU capture (e.g. 100)\n");
+    g_print("  Hint        : Use --timeout <seconds> to set session length, or 0 for continuous\n");
     g_print("\n");
 
     g_main_loop_run(g_main_loop);

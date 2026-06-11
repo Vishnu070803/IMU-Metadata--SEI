@@ -21,18 +21,23 @@ graph TD
     end
 
     subgraph "Host / PC"
-        D -->|RTSP Stream| E(SEI Client)
+        D -->|RTSP Stream| E(SEI Client App)
         E -->|Live HUD| F[Real-time Display]
         E -->|Log| G[CSV Export]
+        
+        D -->|RTSP Stream| J(gst-launch CLI)
+        J -->|Pristine Stream| K[MP4 Recording]
     end
 
     subgraph "Post-Processing"
         D -->|MP4 File| H(SEI Extractor)
+        K -->|MP4 File| H
         H -->|Offline| I[CSV / Analytics]
     end
 
     style B fill:#f96,stroke:#333,stroke-width:2px
     style E fill:#6cf,stroke:#333,stroke-width:2px
+    style J fill:#cf6,stroke:#333,stroke-width:2px
     style H fill:#9f9,stroke:#333,stroke-width:2px
 ```
 

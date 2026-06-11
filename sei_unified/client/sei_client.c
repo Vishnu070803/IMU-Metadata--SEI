@@ -55,12 +55,16 @@
 #include <inttypes.h>
 #include <time.h>
 #include <pthread.h>
+#include <glib-unix.h>
 
 #include "sei_metadata.h"
 
 /* ─── Verbosity flag ────────────────────────────────────────────────────── */
 static int g_verbose = 0;
 static FILE *g_csv_file = NULL;
+
+static GMainLoop *g_main_loop = NULL;
+static GstElement *g_pipeline = NULL;
 
 /* ─── Expected UUID (must match server injection) ───────────────────────── */
 static const uint8_t EXPECTED_UUID[16] = {
@@ -208,7 +212,8 @@ static GstPadProbeReturn sei_extraction_probe(GstPad *pad, GstPadProbeInfo *info
                     meta.mag_x_ut, meta.mag_y_ut, meta.mag_z_ut);
             fflush(stdout);
         }
-        break; /* One SEI NAL per frame */
+        i = ebsp_end - 1;
+        continue; /* Process all SEI NALs in this frame */
     }
 
     gst_buffer_unmap(buffer, &map);
@@ -283,6 +288,59 @@ static void draw_kv(cairo_t *cr, double x, double y,
     cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.95);
     cairo_move_to(cr, x + 90, y);
     cairo_show_text(cr, val);
+}
+
+/* ─── GStreamer Bus & Signal Handlers ──────────────────────────────────── */
+static gboolean bus_call(GstBus *bus, GstMessage *msg, gpointer data) {
+    (void)bus; (void)data;
+    switch (GST_MESSAGE_TYPE(msg)) {
+        case GST_MESSAGE_EOS:
+            g_print("\nEnd of stream reached. MP4 fully finalized.\n");
+            g_main_loop_quit(g_main_loop);
+            break;
+        case GST_MESSAGE_ERROR: {
+            GError *err = NULL; gchar *dbg = NULL;
+            gst_message_parse_error(msg, &err, &dbg);
+            g_printerr("\nError: %s\nDebug: %s\n", err->message, dbg ? dbg : "none");
+            g_error_free(err); g_free(dbg);
+            g_main_loop_quit(g_main_loop);
+            break;
+        }
+        default:
+            break;
+    }
+    return TRUE;
+}
+
+static gboolean eos_timeout_cb(gpointer user_data) {
+    (void)user_data;
+    g_printerr("System Link: WARNING — EOS timeout after 10s, forcing quit (moov may be incomplete).\n");
+    if (g_main_loop) g_main_loop_quit(g_main_loop);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean sigint_handler(gpointer user_data) {
+    (void)user_data;
+    g_print("\nCtrl+C caught! Shutting down client cleanly.\n");
+    
+    gboolean needs_eos = FALSE;
+    if (g_pipeline) {
+        GstState state;
+        gst_element_get_state(g_pipeline, &state, NULL, 0);
+        if (state == GST_STATE_PLAYING || state == GST_STATE_PAUSED) {
+            needs_eos = TRUE;
+        }
+    }
+    
+    if (needs_eos) {
+        g_print("System Link: Sending EOS to finalize the MP4 file (writing moov atom)... Please wait.\n");
+        gst_element_send_event(g_pipeline, gst_event_new_eos());
+        g_timeout_add_seconds(10, eos_timeout_cb, NULL);
+        g_pipeline = NULL; /* prevent double send */
+    } else {
+        if (g_main_loop) g_main_loop_quit(g_main_loop);
+    }
+    return G_SOURCE_REMOVE;
 }
 
 /* ─── Cairo draw callback (video sink thread) ──────────────────────────── */
@@ -404,10 +462,9 @@ int main(int argc, char *argv[])
     char rtsp_url[256];
     snprintf(rtsp_url, sizeof(rtsp_url), "rtsp://%s:%s%s", ip, port, mount);
 
-    g_print("SEI Client — Cairo HUD Display + Overlay Recording (v%d)\n",
+    g_print("SEI Client — Cairo HUD Display (v%d)\n",
             SEI_METADATA_VERSION);
     g_print("  Stream    : %s\n",  rtsp_url);
-    g_print("  Recording : %s\n",  rec_path);
     g_print("  Verbose   : %s\n",  g_verbose ? "yes" : "no (-v for detail)");
     if (csvfile) {
         g_print("  CSV Out   : %s\n", csvfile);
@@ -449,33 +506,20 @@ int main(int argc, char *argv[])
      */
     char pipeline_str[2048];
     snprintf(pipeline_str, sizeof(pipeline_str),
-
-        /* ── Source + decode + HUD ───────────────────────────────────── */
+        /* ── Source + Parse ──────────────────────────────────────────── */
         "rtspsrc location=%s latency=100 ! "
         "rtph264depay ! "
         "h264parse name=disp_parser ! "
         "video/x-h264,stream-format=byte-stream ! "
+        
+        /* DISPLAY branch — decode and apply HUD overlay */
         "avdec_h264 ! "
         "videoconvert ! "
-        "cairooverlay name=hud_overlay ! "     /* HUD applied once here */
-
-        /* ── Fan-out to display AND recorder ─────────────────────────── */
-        "tee name=t "
-
-        /* DISPLAY branch */
-        "t. ! queue max-size-buffers=4 leaky=downstream ! "
+        "cairooverlay name=hud_overlay ! "     /* HUD applied to live display ONLY */
         "videoconvert ! "
-        "autovideosink sync=false "
+        "autovideosink sync=false ",
 
-        /* RECORD branch — re-encode post-overlay frames to MP4 */
-        "t. ! queue max-size-buffers=4 leaky=downstream ! "
-        "videoconvert ! "                      /* BGRA → I420 for x264enc */
-        "x264enc tune=zerolatency bitrate=8000 key-int-max=30 ! "
-        "video/x-h264,stream-format=avc,alignment=au ! "
-        "qtmux fragment-duration=1000 ! "
-        "filesink location=%s sync=false",
-
-        rtsp_url, rec_path);
+        rtsp_url);
 
     GError *error = NULL;
     GstElement *pipeline = gst_parse_launch(pipeline_str, &error);
@@ -519,27 +563,23 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    g_print("\nPipeline running. Press Ctrl-C to stop.\n");
+    g_print("\nPipeline running.\n");
+    g_print("Press Ctrl-C to stop cleanly (will write MP4 moov atom).\n");
     g_print("Recording overlayed stream to: %s\n\n", rec_path);
 
-    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    g_main_loop = g_main_loop_new(NULL, FALSE);
+    g_pipeline = pipeline;
 
     GstBus *bus = gst_element_get_bus(pipeline);
-    GstMessage *msg = gst_bus_timed_pop_filtered(bus, GST_CLOCK_TIME_NONE,
-                          GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
-    if (msg) {
-        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
-            GError *err = NULL; gchar *dbg = NULL;
-            gst_message_parse_error(msg, &err, &dbg);
-            g_printerr("\nError: %s\nDebug: %s\n", err->message, dbg ? dbg : "none");
-            g_error_free(err); g_free(dbg);
-        } else {
-            g_print("\nEnd of stream.\n");
-        }
-        gst_message_unref(msg);
-    }
-
+    guint bus_watch_id = gst_bus_add_watch(bus, bus_call, NULL);
     gst_object_unref(bus);
+
+    g_unix_signal_add(SIGINT, sigint_handler, NULL);
+
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    g_main_loop_run(g_main_loop);
+
+    g_source_remove(bus_watch_id);
     gst_element_set_state(pipeline, GST_STATE_NULL);
     gst_object_unref(pipeline);
 
