@@ -116,6 +116,13 @@ static GstPadProbeReturn sei_extraction_probe(GstPad *pad, GstPadProbeInfo *info
 
         /* Remove EPB → RBSP = UUID(16) + SeiMetadata */
         uint8_t rbsp[16 + sizeof(SeiMetadata) + 32];
+        
+        /* SAFETY CHECK: Prevent stack buffer overflow if SEI payload is large (e.g. x264 config strings) */
+        if (ebsp_end - payload_offset > (int)sizeof(rbsp)) {
+            i = ebsp_end - 1;
+            continue;
+        }
+        
         int decoded_len = remove_emulation_prevention(
                               &data[payload_offset], ebsp_end - payload_offset, rbsp);
 
@@ -167,7 +174,8 @@ static GstPadProbeReturn sei_extraction_probe(GstPad *pad, GstPadProbeInfo *info
                     meta.mag_x_ut, meta.mag_y_ut, meta.mag_z_ut);
             fflush(stdout);
         }
-        break; /* One SEI NAL per frame */
+        i = ebsp_end - 1;
+        continue; /* Process all SEI NALs in this frame */
     }
 
     gst_buffer_unmap(buffer, &map);
