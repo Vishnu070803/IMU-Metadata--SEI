@@ -1,4 +1,4 @@
-# IMU-Avigna SEI Unified Pipeline - Release Notes
+# IMU-Embedded SEI Unified Pipeline - Release Notes
 
 ## Overview
 This release finalizes the transition to a highly stable, C-based unified pipeline for embedding, streaming, and extracting IMU data via H.264/HEVC Supplemental Enhancement Information (SEI) NAL units on the i.MX8M Plus platform. 
