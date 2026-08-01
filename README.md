@@ -1,10 +1,10 @@
-# 🛰️ IMU-Avigna: Unified SEI Metadata Pipeline
+# 🛰️ IMU-Embedded: Unified SEI Metadata Pipeline
 
 [![Project Status: Active](https://img.shields.io/badge/Project%20Status-Active-brightgreen.svg)]()
 [![Platform: i.MX8M Plus](https://img.shields.io/badge/Platform-i.MX8M%20Plus-orange.svg)]()
 [![Hardware: ICM20948](https://img.shields.io/badge/Sensor-ICM20948-blue.svg)]()
 
-**IMU-Avigna** is a high-performance, low-latency framework designed to synchronize and embed high-frequency IMU data (Accelerometer, Gyroscope, Magnetometer) directly into H.264/H.265 video streams. By leveraging **Supplemental Enhancement Information (SEI) NAL units**, this pipeline ensures frame-accurate metadata synchronization for robotics, AR/VR, and stabilized recording applications.
+**IMU-Embedded** is a high-performance, low-latency framework designed to synchronize and embed high-frequency IMU data (Accelerometer, Gyroscope, Magnetometer) directly into H.264/H.265 video streams. By leveraging **Supplemental Enhancement Information (SEI) NAL units**, this pipeline ensures frame-accurate metadata synchronization for robotics, AR/VR, and stabilized recording applications.
 
 ---
 
