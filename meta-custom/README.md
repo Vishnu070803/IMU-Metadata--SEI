@@ -1,6 +1,6 @@
-# meta-custom: BSP Layer for IMU-Avigna
+# meta-custom: BSP Layer for IMU
 
-This Yocto/OpenEmbedded layer provides custom kernel recipes and drivers required for the **IMU-Avigna** project, specifically focusing on the i.MX8M Plus platform and the ICM20948 IMU sensor.
+This Yocto/OpenEmbedded layer provides custom kernel recipes and drivers required for the **IMU** project, specifically focusing on the i.MX8M Plus platform and the ICM20948 IMU sensor.
 
 ---
 
